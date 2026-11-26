@@ -6,7 +6,7 @@ from flask import Flask, Response, g, request
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 # Modifier ce message puis faire "git push" pour tester la chaine CI/CD
-MESSAGE = "Bonjour ! Application deployee par Jenkins sur Kubernetes."
+MESSAGE = "Version 2 : mise a jour automatique reussie !"
 
 VERSION = os.getenv("APP_VERSION", "dev")
 
