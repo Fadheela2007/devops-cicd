@@ -1,0 +1,42 @@
+# Complete docker-compose.yml (Docker Compose fusionne les deux fichiers tout seul)
+# Les adresses fixes evitent de prendre celle de Minikube (192.168.49.2)
+services:
+  jenkins:
+    build: ./jenkins
+    image: jenkins-devops:local
+    group_add:
+      - "${DOCKER_GID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./kubeconfig:/var/jenkins_home/kubeconfig:ro
+    networks:
+      default:
+      minikube:
+        ipv4_address: 192.168.49.10
+
+  prometheus:
+    networks:
+      default:
+      minikube:
+        ipv4_address: 192.168.49.11
+
+  grafana:
+    volumes:
+      - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/mon-app.yml:ro
+      - ./dashboards:/var/lib/dashboards:ro
+
+  # Rend l'application Kubernetes accessible sur http://192.168.56.10:8083
+  app-proxy:
+    image: alpine/socat
+    container_name: app-proxy
+    restart: unless-stopped
+    command: TCP-LISTEN:8083,fork,reuseaddr TCP:minikube:30081
+    ports:
+      - "8083:8083"
+    networks:
+      minikube:
+        ipv4_address: 192.168.49.12
+
+networks:
+  minikube:
+    external: true

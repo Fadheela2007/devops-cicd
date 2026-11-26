@@ -1,0 +1,7 @@
+apiVersion: 1
+
+providers:
+  - name: mon-app
+    type: file
+    options:
+      path: /var/lib/dashboards

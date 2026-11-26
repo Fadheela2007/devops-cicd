@@ -1,0 +1,194 @@
+---
+# Playbook Ansible exécuté DANS la VM par Vagrant (provisioner ansible_local)
+# Installe : Docker, kubectl, Minikube, Jenkins, Prometheus, Grafana
+- name: Installation de l'environnement DevOps
+  hosts: all
+  become: true
+
+  vars:
+    vm_user: vagrant
+    stack_dir: /opt/devops-stack
+
+  tasks:
+    # ---------------------------------------------------------------
+    # 1. Paquets de base
+    # ---------------------------------------------------------------
+    - name: Mettre à jour le cache apt et installer les paquets de base
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, gnupg, conntrack, apt-transport-https]
+        state: present
+        update_cache: true
+
+    # ---------------------------------------------------------------
+    # 2. Docker (dépôt officiel)
+    # ---------------------------------------------------------------
+    - name: Créer le dossier des clés apt
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Télécharger la clé GPG de Docker
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Ajouter le dépôt Docker
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu jammy stable"
+        filename: docker
+        state: present
+
+    - name: Installer Docker et le plugin Docker Compose
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+        state: present
+        update_cache: true
+
+    - name: Ajouter l'utilisateur vagrant au groupe docker
+      ansible.builtin.user:
+        name: "{{ vm_user }}"
+        groups: docker
+        append: true
+
+    # Docker écoute aussi sur le port 2375 pour que Terraform (sur l'hôte)
+    # puisse créer des conteneurs dans la VM. ATTENTION : non sécurisé,
+    # uniquement pour un TP sur réseau privé.
+    - name: Créer le dossier de configuration systemd de Docker
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Exposer l'API Docker sur tcp://0.0.0.0:2375 (pour Terraform)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/override.conf
+        mode: "0644"
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2375 --containerd=/run/containerd/containerd.sock
+      register: docker_override
+
+    - name: Redémarrer Docker si la configuration a changé
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: docker_override.changed
+
+    # ---------------------------------------------------------------
+    # 3. Kubernetes : kubectl + Minikube
+    # ---------------------------------------------------------------
+    - name: Installer kubectl (dernière version stable)
+      ansible.builtin.shell: |
+        set -e
+        VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+        curl -L -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
+        chmod +x /usr/local/bin/kubectl
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/kubectl
+
+    - name: Installer Minikube
+      ansible.builtin.get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /usr/local/bin/minikube
+        mode: "0755"
+
+    - name: Vérifier si Minikube tourne déjà
+      ansible.builtin.shell: sg docker -c "minikube status"
+      become_user: "{{ vm_user }}"
+      environment:
+        HOME: "/home/{{ vm_user }}"
+      register: minikube_status
+      changed_when: false
+      failed_when: false
+
+    - name: Démarrer Minikube (driver docker)
+      ansible.builtin.shell: sg docker -c "minikube start --driver=docker --cpus=2 --memory=2048"
+      become_user: "{{ vm_user }}"
+      environment:
+        HOME: "/home/{{ vm_user }}"
+      when: minikube_status.rc != 0
+
+    - name: Déployer l'application de démonstration dans Kubernetes
+      ansible.builtin.shell: kubectl apply -f /vagrant/k8s/demo-app.yaml
+      become_user: "{{ vm_user }}"
+      environment:
+        HOME: "/home/{{ vm_user }}"
+      register: kubectl_apply
+      changed_when: "'created' in kubectl_apply.stdout or 'configured' in kubectl_apply.stdout"
+
+    # ---------------------------------------------------------------
+    # 4. Jenkins + Prometheus + Grafana (conteneurs Docker)
+    # ---------------------------------------------------------------
+    - name: Créer le dossier de la stack
+      ansible.builtin.file:
+        path: "{{ stack_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copier les fichiers Docker Compose, Prometheus et Grafana
+      ansible.builtin.copy:
+        src: files/monitoring/
+        dest: "{{ stack_dir }}/"
+        mode: "0644"
+
+    # --- Ajout CI/CD : acces de Jenkins a Kubernetes et a Docker ---
+    - name: Lire la configuration Kubernetes pour Jenkins
+      ansible.builtin.command: kubectl config view --flatten --minify
+      become_user: "{{ vm_user }}"
+      environment:
+        HOME: "/home/{{ vm_user }}"
+      register: kube_conf
+      changed_when: false
+      no_log: true
+
+    - name: Enregistrer le kubeconfig de Jenkins
+      ansible.builtin.copy:
+        content: "{{ kube_conf.stdout }}"
+        dest: "{{ stack_dir }}/kubeconfig"
+        owner: "1000"
+        mode: "0600"
+      no_log: true
+
+    - name: Lire le groupe docker
+      ansible.builtin.getent:
+        database: group
+        key: docker
+
+    - name: Transmettre le numero du groupe docker a Docker Compose
+      ansible.builtin.copy:
+        content: "DOCKER_GID={{ ansible_facts.getent_group.docker[1] }}\n"
+        dest: "{{ stack_dir }}/.env"
+        mode: "0644"
+
+    - name: Lancer Jenkins, Prometheus, Grafana, node-exporter et cAdvisor
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ stack_dir }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"
+
+    # ---------------------------------------------------------------
+    # 5. Récupérer le mot de passe initial de Jenkins
+    # ---------------------------------------------------------------
+    - name: Attendre que Jenkins génère son mot de passe initial
+      ansible.builtin.command: docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+      register: jenkins_pwd
+      retries: 30
+      delay: 10
+      until: jenkins_pwd.rc == 0
+      changed_when: false
+
+    - name: Afficher le récapitulatif
+      ansible.builtin.debug:
+        msg:
+          - "Jenkins    : http://192.168.56.10:8080  (mot de passe initial : {{ jenkins_pwd.stdout }})"
+          - "Grafana    : http://192.168.56.10:3000  (admin / admin)"
+          - "Prometheus : http://192.168.56.10:9090"
+          - "Kubernetes : 'vagrant ssh' puis 'kubectl get pods'"
+          - "Terraform  : depuis la machine hôte, dossier terraform/"
